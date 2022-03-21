@@ -1,0 +1,40 @@
+/* Load Data From HDFS as ads*/
+ads = LOAD 's3://lfhz1997/ads/ads.csv' USING PigStorage (',') AS (
+id,
+click,
+hour,
+C1,
+banner_pos,
+site_id,
+site_domain,
+site_category,
+app_id,
+app_domain,
+app_category,
+device_id, 
+device_ip, 
+device_model,
+device_type,
+device_conn_type,
+C14,
+C15,
+C16,
+C17,
+C18,
+C19,
+C20,
+C21);
+describe ads;
+
+/* Group by Data by site_id. */
+ads_group = GROUP ads BY site_id;
+/* Perform aggregation for each unique site */
+ctr_calculation = FOREACH ads_group GENERATE group, SUM(ads.click) as num_clicks, COUNT(ads.site_id) as num_impressions, SUM(ads.click)/COUNT(ads.site_id) as click_through_rate;
+/* Limit to sites that have at least 10 impressions */
+ctr_calculation = FILTER ctr_calculation BY num_impressions >=10;
+/* Sort data based on click_through_rate. */
+ctr_calculation = ORDER ctr_calculation BY click_through_rate DESC;
+/* Show the top 10 sites by CTRs. */
+top_10_ctr = LIMIT ctr_calculation 10;
+/* Print Results. */
+dump top_10_ctr;

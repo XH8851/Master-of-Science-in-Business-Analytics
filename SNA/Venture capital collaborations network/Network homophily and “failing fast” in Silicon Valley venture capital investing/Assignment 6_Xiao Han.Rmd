@@ -1,0 +1,768 @@
+---
+title: "..."
+output:
+---
+
+# Import the packages
+```{r}
+
+library(igraph)
+library(data.table)
+library(reshape)
+library(tidyr)
+library(reshape2)
+library(expm)
+library(plyr)
+library(readxl)
+library(purrr)
+library(sqldf)
+library(ggplot2)
+library(zoo)
+library(ITNr)
+library(dplyr)
+library(cluster)
+library(tidyverse) 
+library(factoextra)
+library(lubridate)
+library(PearsonDS)
+library('Matrix')
+library(stringr)
+library(MASS)
+library(gdata)
+library(proxy)
+library(plm)
+library(RSiena)
+library(sna)
+library(geosphere)
+library(nnet)
+
+setwd('...')
+
+
+```
+
+
+
+# Load the data
+```{r}
+
+data_execs = fread("execs.csv", header = TRUE, encoding="Latin-1")
+data_invPerson = fread("individual_investors.csv", header = TRUE, encoding="Latin-1")
+dataDeal = fread("deal_details.csv", header = TRUE, encoding = "Latin-1")
+
+dataInv = fread("investor_details.csv", header = TRUE, encoding = "Latin-1")
+dataStartup = fread("company_details.csv", header = TRUE, encoding = "Latin-1")
+dataPerson = fread("people.csv", header = TRUE, encoding = "Latin-1")
+
+dataName = fread("representative_names.csv", header = TRUE, encoding = "Latin-1")
+
+```
+
+
+
+# Preprocess the data before predictors
+```{r}
+
+# Limit the analysis to only deals from the 2000s onward
+
+# Process the character type of date to be date type
+dataDeal$Deal_Date = as.Date(dataDeal$Deal_Date, "%d %b %y")
+dataDeal$year = format(dataDeal$Deal_Date, format = "%Y")
+
+# I keep the ties before 2019 as we did in assignment 5 because: 1. some year variables "2066" make the data confusing; 2. deals after 2018 but before 2022 are few.
+dataDeal = dataDeal[(dataDeal$year >= 2000) & (dataDeal$year <= 2018),]
+
+# Consider investments to be all deals in the Deal Class “Venture Capital”
+dataDeal = dataDeal[dataDeal$Deal_Class == "Venture Capital", ] 
+
+# Focus the set of entrepreneurs just on those whose Full Title is indicated to be “Founder”, “Chief Executive Officer”, or “Managing Director”.
+
+data_execs = data_execs[data_execs$Full_Title %in% c("Founder", "Chief Executive Officer", "Managing Director"), ]
+
+# Exclude individuals that appear as both investors and entrepreneurs in the data
+
+personStartup = data_execs$PersonId
+personInvestor = data_invPerson$PersonId
+excludePerson = personStartup %in% personInvestor
+data_execs = data_execs[!data_execs$PersonId %in% excludePerson, ]
+data_invPerson = data_invPerson[!data_invPerson$PersonId %in% excludePerson, ]
+dataPerson = dataPerson[!dataPerson$PersonId %in% excludePerson,]
+
+# only include investment deals that occur within the last twenty years—for some industries that are newer, you can use more recent time periods.
+
+# We have excluded the deals before 2000 and after 2018, and the "within the last twenty years" would be from 1999 to 2018. Therefore, I chose not to exclude any investments. I think they are modern enough, while excluding too many deals will make the industry information inaccurate.
+
+
+
+# Combine the investor information to data_execs
+
+## Make the investors into edges
+data_execs = data.table(data_execs)
+data_execs[, number := seq_len(.N), by = CompanyId]
+
+pairs = split(data_execs, f = data_execs$number)
+
+for(i in seq_along(pairs)){
+  setkey(pairs[[i]], CompanyId)
+}
+
+## Merge the investor-individual information
+setkey(data_invPerson, CompanyId)
+
+edges = list()
+for(i in seq_along(pairs)){
+  edges[[i]] = merge(data_invPerson, pairs[[i]])
+}
+
+edges = rbindlist(edges)
+
+colnames(edges)[colnames(edges) == "PersonId.x"] = "investor"
+colnames(edges)[colnames(edges) == "PersonId.y"] = "person"
+
+
+
+# Get the personal information
+
+dataPerson = dataPerson[,c("PersonId", "Gender", "Education")]
+
+## Merge the information with investors
+colnames(dataPerson)[colnames(dataPerson) == "PersonId"] = "investor"
+dataPerson = data.table(dataPerson)
+setkey(dataPerson, investor)
+
+edges = data.table(edges)
+setkey(edges, investor)
+
+edges = merge(edges, dataPerson)
+
+
+## Merge the information with people
+colnames(dataPerson)[colnames(dataPerson) == "investor"] = "person"
+setkey(dataPerson, person)
+
+setkey(edges, person)
+
+colnames(edges)[colnames(edges) == "Last Updated"] = "Last_Update_1"
+colnames(edges)[colnames(edges) == "Last_Updated"] = "Last_Update_2"
+edges[, Last_Updated_1 := NULL]
+edges[, Last_Updated_2 := NULL]
+
+edges = merge(edges, dataPerson)
+
+
+
+# Get the company information
+
+setkey(dataStartup, CompanyId)
+setkey(edges, CompanyId)
+
+to_add = c("CompanyId", "Primary_Industry_Sector", "Primary_Industry_Group", "Primary_Industry_Code", "Business_Status", "City", "State")
+
+edges = merge(edges, ataStartup[, to_add])
+rm(to_add)
+
+
+
+# Get the deal information
+
+setkey(dataDeal, DealId)
+setkey(edges, DealId)
+
+edges = merge(edges, dataDeal)
+
+
+
+```
+
+
+
+# Choose five industry groups
+```{r}
+
+retail = edges[which(edges$Primary_Industry_Group=="Retail"),]
+media = edges[which(edges$Primary_Industry_Group=="Media"),]
+trans = edges[which(edges$Primary_Industry_Group=="Transportation"),]
+insur = edges[which(edges$Primary_Industry_Group=="Insurance"),]
+rest = edges[which(edges$Primary_Industry_Group=="Restaurants, Hotels and Leisure"),]
+  
+```
+
+
+
+# Structural predictors
+```{r}
+
+# As is stated in the assignment description, these parameters do not have an interaction in includeEffects(). We are supposed to, however, include in the model predictors for the following types of variables using the includeEffects() function.
+
+# Therefore, I assume that these predictors will be generated by the function and R automatically.
+
+```
+
+
+
+# Dyadic predictors
+
+When I dealed with the homophily, I realized I understood the homophily in a wrong way. In the example, https://www.stats.ox.ac.uk/~snijders/siena/RscriptSienaBipartite.R, which is the SIENA example on the teenage networks, the homophily was driven from a .dat file, then tranferred to be demographic info, then bipartite data, then was recoded into meaningful affiliation info and added to bipartite network before using includeEffects(). 
+
+The way to compute the homophily in the final step of every computation of homiphily:
+
+Use coDyadCovar() to transfer the objects into constant, time-invariant dyadic covariates.
+
+These covariates should be input in the form of a matrix where the rows and columns match those of the adjacency matrix.
+
+## Ethnic homophily
+```{r}
+
+dataName = dataName[,c("Name","race")]
+
+## For Investors
+
+df1 = merge(unique(retail[,"investor"]), dataPerson[,c("PersonId","Last Name")], by.x="investor", by.y="PersonId")
+
+## Make the characters all uppercase.
+df1$`Last Name` = toupper(df1$`Last Name`) 
+df1 = merge(df1, dataName, by.x="Last Name", by.y="Name", all.x = TRUE)
+
+## Exclude the "white"
+df1[which(df1$race=="white"),"race"] = NA
+df1 = as.vector(df1)
+
+## The same goes to the "person"
+
+df11 = merge(unique(retail[,"person"]), dataPerson[,c("PersonId","Last Name")], by.x="person", by.y="PersonId")
+df11$`Last Name` = toupper(df11$`Last Name`) 
+df11 = merge(df11, dataName, by.x="Last Name", by.y="Name", all.x = TRUE)
+df11[which(df11$race=="white"),"race"] = NA
+df11 = as.vector(df11)
+
+# These covariates should be input in the form of a matrix where the rows and columns match those of the adjacency matrix.
+
+## Use outer() to compute the homophily covariate as an outer product.
+
+df111 = outer(df1, df11,"==")
+df111[is.na(df111)] = 0
+rownames(df111) = rownames(df1)
+colnames(df111) = rownames(df11)
+
+matrixEthnic = coDyadCovar(df111, nodeSets=c("Senders", "Receivers"),type = "bipartite")
+
+```
+
+
+
+## Gender homophily
+```{r}
+
+# Get the gender info;
+
+df1 = unique(retail[,c("investor","Gender.x")])
+df11 = unique(retail[,c("person","Gender.y")])
+
+# Similarly, join the information with PersonId and add the information to edges;
+
+df1 = as.vector(setNames(df1$Gender.x, df1$investor))
+df11 = as.vector(setNames(df11$Gender.y,df11$person))
+
+# Use outer().
+df111 = outer(df1, df11, "==")
+df111[is.na(df111)] = 0
+rownames(df111) = rownames(df1)
+colnames(df111) = rownames(df11)
+
+matrixGender = coDyadCovar(df111, nodeSets=c("Senders", "Receivers"),type = "bipartite")
+
+```
+
+
+## Top school homophily
+```{r}
+
+df1 = unique(retail[,c("investor","Education.x")])
+df11 = unique(retail[,c("person","Education.y")])
+
+# Produce a list of top educational institutions, like Ivy League and international schools that also represent top schools worldwide;
+
+topSchool = c("Emory University", "Brown University", "Columbia University", "Cornell University", "Dartmouth College", "Harvard", "Princeton University", "University of Pennsylvania", "Yale University", "Stanford", "Northwestern University", "Massachusetts Institute of Technology", "Berkeley", "University of Chicago", "Carnegie Mellon University", "Oxford", "Cambridge", "Peking University", "Tsinghua", "Fudan")
+
+# Merge the information with people.csv's "Education";
+## The "Education" contains much information including institutions, graduation time and degree. I think this one would work: grepl(needle, haystack, fixed=TRUE), to find out if the education information contains the top educational institutions in our list.
+df1$topSchool = grepl(paste(topSchool,collapse="|"), df1$Education.x)
+df11$topSchool = grepl(paste(topSchool,collapse="|"), df11$Education.y)
+
+# Compute the logical top school homophily based on whether the investor and entrepreneur earned a degree from a top educational institution.
+
+df1 = as.vector(setNames(df1$topSchool, df1$investor))
+df11 = as.vector(setNames(df11$topSchool, df11$person))
+
+# Use outer().
+
+df111 = outer(df1, df11, "==")
+df111[is.na(df111)] = 0
+rownames(df111) = rownames(df1)
+colnames(df111) = rownames(df11)
+
+matrixTopSchool = coDyadCovar(df111, nodeSets=c("Senders", "Receivers"),type = "bipartite")
+
+
+rm(topSchool)
+
+```
+
+
+
+## Geographic homophily
+```{r}
+df1 = unique(retail[, c("investor","InvestorId")])
+df11 = unique(retail[, c("person","CompanyId")])
+
+# Load the *edges_dist.RData* by double-click
+
+# Merge the edges_dist using "PersonId", "CompanyId"
+
+## longitude and latitude of the investors’ and entrepreneurs’ headquarters.
+
+df1 = merge(df1,unique(edges_dist[,c(1,6,5)]),by = "InvestorId",all.x = TRUE)
+df11 = merge(df11,unique(edges_dist[,c(2,4,3)]),by = "CompanyId", all.x = TRUE)
+
+# Keep the the first location ascribed to them in the data if if individuals have multiple locations.
+
+df1 = data.table(df1)
+df1[, num := seq_len(.N), by = investor]
+df1 = df1[which(num == 1),]
+
+df11 = data.table(df11)
+df11[, num := seq_len(.N), by = person]
+df11 = df11[which(num == 1),]
+
+# Similarly create the matrix
+
+df1 = data.frame(unique(df1[,c(2:4)]), row.names = 1)
+df11 = data.frame(unique(df11[,c(2:4)]), row.names = 1)
+
+## This covariate can be computed using distm() from the geosphere library, applying fun = distGeo, where the inputs to distm() are the longitude and latitude of the investors’ and entrepreneurs’ headquarters.
+
+df111 = distm(as.matrix(df1),as.matrix(df11),fun = distGeo)
+rownames(df111) = rownames(df1)
+colnames(df111) = rownames(df11)
+
+matrixGeo = coDyadCovar(df111,nodeSets = c("Senders", "Receivers"),type = "bipartite")
+
+```
+
+
+
+## Experience homophily
+```{r}
+df1 = unique(retail[,c("investor","Year")])
+df11 = unique(retail[,c("person","Year")])
+
+#Produce a list to compute how many years from the first time to the current year when an investor/entrepreneur got involved in a deal.
+
+df1 = df1 %>% 
+  group_by(investor) %>% 
+  summarise(first = min(Year))
+
+df11 = df11 %>% 
+  group_by(person) %>% 
+  summarise(first = min(Year))
+
+df1 = as.vector(setNames(df1$first, df1$investor))
+df11 = as.vector(setNames(df11$first, df11$person))
+
+# Compute the maximum difference
+
+df111 = outer(df1, df11, "-")
+df111 = abs(df111)
+df111 = max(df111) - df111
+
+rownames(df111) = rownames(df1)
+colnames(df111) = rownames(df11)
+
+matrixExp = coDyadCovar(df111,nodeSets = c("Senders", "Receivers"),type = "bipartite")
+
+```
+
+
+
+## Complementary skills
+```{r}
+
+df1 = unique(retail[,c("investor","Education.x")])
+df11 = unique(retail[,c("person","Education.y")])
+
+# Use the Education in people.csv and grepl(needle, haystack, fixed=TRUE), to find out if the person is a technical or business person.
+
+df1$tech = grepl("engineering|ph.D", df1$Education.x)
+df1$biz = grepl("MBA", df1$Education.x)
+
+df11$tech = grepl("engineering|ph.D", df11$Education.y)
+df11$biz = grepl("MBA", df11$Education.y)
+
+# Create a logical vector based whether the investor is one of the types and the entrepreneur is one of the different types.
+
+## tech + biz
+df1 = as.vector(setNames(df1$tech, df1$investor))
+df11 = as.vector(setNames(df11$biz, df11$person))
+
+df111 = outer(df1, df11, "&")
+
+## biz + tech
+df1 = as.vector(setNames(df1$biz, df1$investor))
+df11 = as.vector(setNames(df11$tech, df11$person))
+
+df1111 = outer(df1, df11, "&")
+
+## Merge the two tables
+df111 = df111 + df1111
+
+rm(df1111)
+
+rownames(df111) = rownames(df1)
+colnames(df111) = rownames(df11)
+
+matrixSkill = coDyadCovar(df111,nodeSets = c("Senders", "Receivers"),type = "bipartite")
+
+```
+
+
+
+# Individual predictors for entrepreneurs
+
+```{r}
+
+# Ethnic minority
+
+## Based on the PersonId-race information we got when we computed the ethnic homophily, add a constant alter covariate indicating that the *entrepreneur* has a race that is not White to our data.
+
+## Get the data. Everything is similar to the process of ethnic homophily.
+df11 = merge(unique(retail[,"person"]), dataPerson[, c("PersonId","Last Name")],by.x = "person",by.y = "PersonId")
+df11$`Last Name` = toupper(df11$`Last Name`) 
+df11 = merge(df1, dataName, by.x = "Last Name", by.y = "Name", all.x = TRUE)
+
+## Exclude the "white"
+df11$minority = df11$race != "white"
+
+df11 = as.vector(setNames(df11$minority,df11$person))
+df111[df111 == FALSE | is.na(df11)] = 0
+
+matrixEthnicInd = coCovar(df11,nodeSets = c("Receivers"))
+
+
+
+# Entrepreneur gender
+
+## Based on the PersonId-gender info we got when we computed the gender homophily, add a constant alter covariate indicating an *entrepreneur*'s gender to our data.
+
+df11 = unique(retail[,c("person","Gender.y")])
+
+df11 = as.vector(setNames(df11$Gender.y,df11$person))
+df11[df11 == "Male"] = 0
+df11[df11 == "Female"] = 1
+df11 = as.numeric(df11)
+
+matrixGenderInd = coCovar(df11,nodeSet = "Receivers")
+
+
+
+# Entrepreneur top school
+
+## Based on PersonId-top-school info we got when we computed the top school homophily, add a constant alter covariate indicating whether an *entrepreneur* earned a degree from a top educational institution to our data.
+
+df11 = unique(retail[,c("person","Education.y")])
+
+df11$topSchool = grepl(paste(topSchool,collapse="|"), df11$Education.y)
+
+df11 = as.vector(setNames(df11$topSchool,df11$person))
+df11[df11 == FALSE] = 0
+
+matrixTopSchoolInd = coCovar(df11,nodeSet="Receivers")
+
+
+
+# Entrepreneur geographic hub
+
+## Get a list of cities and the frequency they appeared using CompanyId and City information from "company_details.csv".
+
+df11 = unique(retail[,c("person","City")])
+
+## Save the first city of the person
+df11[!duplicated(df11$person),]
+
+df11 = data.table(df11)
+
+## Find out the top 10 common cities.
+df11[, topCity := seq_len(.N), by = City]
+topCity = sqldf("select distinct City from df11 order by desc topCity limit 10")
+
+## Judge if this start-up is in the top 10 common cities.
+df11$hub = df11$City %in% topCity
+
+df11 = as.vector(setNames(df11$hub,df11$person))
+df11[df11 == FALSE] = 0
+
+matrixHubInd = coCovar(df11,nodeSet="Receivers")
+
+
+
+# Entrepreneur experience
+
+## Based on PersonId-experience info we got when we computed the experience homophily, add a constant alter covariate indicating the year an entrepreneur’s first venture received funding to our data.
+
+df11 = unique(retail[,c("person","Year")])
+
+df11 = df11 %>% 
+  group_by(person) %>% 
+  summarise(first = min(Year))
+
+df11 = as.vector(setNames(df11$first, df11$person))
+
+df11 = abs(df11)
+df11 = max(df11) - df11
+
+matrixExpInd = coCovar(df11,nodeSet="Receivers")
+
+
+
+# Entrepreneur business skills
+
+## Based on PersonId-complementary-skills info we got when we computed the experience homophily, add a constant alter covariate indicating whether an entrepreneur received an MBA to our data.
+
+df11 = unique(retail[,c("person","Education.y")])
+df11$biz = grepl("MBA", df11$Education.y)
+
+df11 = as.vector(setNames(df11$biz, df11$person))
+
+matrixBizInd = coCovar(df11,nodeSet = "Receivers")
+
+
+
+# Entrepreneur technical skills
+
+## Based on PersonId-complementary-skills info we got when we computed the experience homophily, add a constant alter covariate indicating whether an entrepreneur received a technical degree like a PhD or an engineering degree to our data.
+
+df11 = unique(retail[,c("person","Education.y")])
+df11$tech = grepl("engineering|ph.D", df11$Education.y)
+
+df11 = as.vector(setNames(df11$tech, df11$person))
+
+matrixTechInd = coCovar(df11,nodeSet = "Receivers")
+
+
+
+# Entrepreneur venture round
+
+## Compute the cumulative count of unique funding deals it has received from investors.
+
+df11 = unique(retail[,c("person","DealId")])
+df11 = data.table(df11)
+df11[, round := seq_len(.N), by = person]
+
+df11 = as.vector(setNames(df11$round, df11$person))
+
+matrixRoundInd = coCovar(df11,nodeSet = "Receivers")
+
+```
+
+
+
+# Other work
+```{r}
+
+# Take account of when people join and leave the network
+
+retail[, joined := as.Date(Date.Joined.Company, "%m/%d/%Y")]
+retail[, left := as.Date(Date.Left.Company, "%m/%d/%Y")]
+
+retail[!is.na(joined) & !is.na(date), exclude_date_joined := joined > date]
+retail[!is.na(left) & !is.na(date), exclude_date_left := left < date]
+
+retail[is.na(joined), exclude_date_joined := FALSE]
+retail[is.na(left), exclude_date_left := FALSE]
+
+```
+
+
+
+# Regression
+```{r}
+
+data = sienaDataCreate(matrixEthnic, nodeSets = list(Senders,Receivers))
+SienaEffect = getEffects(Data)
+
+# Well-organize the data for regression
+
+## When using includeEffectes, we add structural predictors like this:
+
+SienaEffect = includeEffects(SienaEffect, altX, interaction1 = "matrixEthnicInd")
+SienaEffect = includeEffects(SienaEffect, altX, interaction1 = "matrixGenderInd")
+SienaEffect = includeEffects(SienaEffect, altX, interaction1 = "matrixTopSchoolInd")
+SienaEffect = includeEffects(SienaEffect, altX, interaction1 = "matrixHubInd")
+SienaEffect = includeEffects(SienaEffect, altX, interaction1 = "matrixExpInd")
+SienaEffect = includeEffects(SienaEffect, altX, interaction1 = "matrixBizInd")
+SienaEffect = includeEffects(SienaEffect, altX, interaction1 = "matrixTechInd")
+SienaEffect = includeEffects(SienaEffect, altX, interaction1 = "matrixRoundInd")
+
+
+
+## Add "cycle4" here, "outActSqrt", "inPopSqrt" and "outinAss"
+SienaEffect = includeEffects(SienaEffect, cycle4, outActSqrt, inPopSqrt, outInAss)
+
+## Add homophily
+SienaEffect = includeEffects(SienaEffect, egoX, altX, simX, interaction1 = "matrixGender")
+SienaEffect = includeEffects(SienaEffect, egoX, altX, simX, interaction1 = "matrixTopSchool")
+SienaEffect = includeEffects(SienaEffect, egoX, altX, simX, interaction1 = "matrixGeo")
+SienaEffect = includeEffects(SienaEffect, egoX, altX, simX, interaction1 = "matrixExp")
+SienaEffect = includeEffects(SienaEffect, egoX, altX, simX, interaction1 = "matrixSkill")
+
+
+
+# Create algorithm object
+
+## Like this:
+
+bipModel <- sienaAlgorithmCreate(
+  useStdInits = FALSE, projname = 'homework_6',
+  cond = FALSE,seed = 1234567)
+
+
+# Run the regression
+
+## Like this:
+
+bipResults = siena07(bipModel, data = data, effects = SienaEffect, nbrNodes = 4, useCluster = TRUE, initC = TRUE)
+
+
+
+## Make sure the SIENA model has converged properly, make sure all convergence t-ratios are below 0.1 and the maximum convergence t-ratio is below 0.25.
+
+## If not, run bipResults = siena07(bipModel, data = bipData, effects = SienaEffect, nbrNodes = 4, useCluster = TRUE, initC = TRUE, prevAns = bipResults)
+
+
+
+# Rerun the results by changing the industry name
+
+
+
+```
+
+
+
+# Extra credit
+
+## Question A
+
+### avoid going out of business
+
+```{r}
+
+# y-variable: get the "out_of_business" information
+
+
+
+# x-variable:  
+
+## "l4c_scaled" information
+
+## the gender homophily, ethnic homophily, age homophily, geographic homophily, top school homophily, complementary homophily from "# Other homophily" in the last question.
+
+## the entrepreneur ethnic minority, entrepreneur gender, entrepreneur top school information from "# Individual predictors for entrepreneurs" in the last question.
+
+
+
+# Control:
+
+## Get the longitude and latitude of the investor in and the year from the dataset 'edges_dist' joining PersonId and Investor_Id.
+
+
+
+# Run the survival regression like this:
+
+## summary(glm(out_of_business ~ predictors + controls + year, data, family = "binomial"))
+
+
+
+```
+
+
+
+### achieve more successful investments
+
+```{r}
+
+# y-variable: get the number of successful investments from "successful_investments"
+
+
+
+# x-variable: include the same variables in the last section, and run the model like:
+
+## rq.counts(successful_investments ~ predictors + controls + year, data, tau = .5, M = 100)
+
+
+
+```
+
+
+
+## Question B
+
+```{r}
+
+# y-variable
+
+## set the 'company_state' in the 'startup_states.csv' to be factor(company_state, levels = c("startup", "exit", "generating revenue", "profitable", "not profitable", "out of business")), which sets the "startup" as the baseline.
+
+
+
+# x-variable
+
+## include the same variables in the last section
+
+
+
+# Regression
+
+## use multinom() from library(nnet) like
+
+# multinom(company_state ~ predictors + controls + year, data)
+
+
+
+# Computing parameters
+
+## z = summary(model)$coefficients/summary(model)$standard.errors
+
+## significance = (1 - pnorm(abs(z), 0, 1)) * 2
+
+## Judge if the value is below 0.05 to find significant predictor.
+
+
+
+```
+
+
+
+## Question C
+
+```{r}
+
+# Merge the information of the proportion of entrepreneurs with different kinds of training in technical or business expertise to the data, as 'technical_exec' and 'mba_exec'.
+
+
+
+# Get the lagged value of each kind of homophily and time-averages for each predictor
+
+
+
+# Get the outdegree information
+
+
+
+# Run the regression using glm with family = quasibinomial(link = "logit"), model = "within" and effect = "individual"
+
+## summary(glm(proportion_tech ~ lag_Predictor + control + factor(year), data, family = quasibinomial(link = "logit"), effect = "individual", index = c("Investor_Id"), model = "within"))
+
+
+
+
+```
+

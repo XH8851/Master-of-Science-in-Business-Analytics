@@ -1,0 +1,723 @@
+---
+title: "..."
+output: html_document
+---
+
+#Import the packages
+```{r}
+library(igraph)
+library(data.table)
+library(reshape)
+library(tidyr)
+library(reshape2)
+library(expm)
+library(plyr)
+library(readxl)
+library(purrr)
+library(sqldf)
+library(ggplot2)
+library(zoo)
+library(ITNr)
+library(dplyr)
+library(cluster)
+library(tidyverse) 
+library(factoextra)
+library(lubridate)
+library(PearsonDS)
+library('Matrix')
+library(MASS)
+
+setwd('...')
+
+```
+
+Load the data
+```{r}
+dataCastNum = fread("film_cast_members.csv", header = TRUE, encoding="Latin-1")
+dataKeywords = fread("film_keywords.csv", header = TRUE, encoding="Latin-1")
+dataGenres = fread("films_and_genres.csv", header = TRUE, encoding="Latin-1")
+dataFilms = fread("producers_and_films.csv", header = TRUE, encoding="Latin-1")
+dataTime = fread("production_subsidiaries.csv", header = TRUE, encoding="Latin-1")
+dataBox = fread("box_office_revenues.csv", header = TRUE, encoding="Latin-1")
+```
+
+#Preprocess the Data
+##Specialist and generalist
+```{r}
+dataFilms = fread("producers_and_films.csv", header = TRUE, encoding="Latin-1")
+
+# Filter the country to be "us"
+dataFilms = dataFilms[country == "us"]
+
+```
+
+Find each year's eigenvector centrality
+```{r}
+
+# Dataframe 'producerCore' stores the coreness of each company in each year.
+producerCore = data.frame(prod_company = character(), 
+                          year = integer(), 
+                          coreness = double())
+# Get all years in the dataset
+allYear = sort(unique(dataFilms$year))
+
+# The loop calculates the set of corenesses of companies in each year.
+for(i in allYear){
+  
+  # Get year, film and producer.
+  filmDF = dataFilms[(dataFilms$year == i), c(2,3,5)]
+  
+  # Affiliation table
+  affiDF = as.data.frame.matrix(table(filmDF[,c(3,2)]))
+  affiDF = as.matrix(affiDF)
+  
+  # Coaffiliation table
+  coaffiDF = affiDF %*% t(affiDF)
+  coaffiDF[coaffiDF != 0 ] = 1
+  diag(coaffiDF) = 0
+  
+  # Adjacency matrix
+  filmDG = graph.adjacency(as.matrix(coaffiDF), mode = "undirected")
+  
+  # Eigenvector centrality
+  
+  eigen = sort(igraph::evcent(filmDG)$vector, decreasing = TRUE)
+  
+  ev = data.frame(prod_company = names(eigen), ev = unname(eigen))
+  ev$year = i
+  
+  producerCore = rbind(producerCore, ev)
+  
+}
+
+# Add the coreness information to film-producer table.
+affliCore = left_join(dataFilms, producerCore, by = c("prod_company", "year"))
+
+```
+
+Get the ten-year level observations
+
+I assume: 
+
+1. The quartile is calculated based on the coreness of all producers, or being core or periphery makes no sense if the company is only compared with itself in the past. Also, in office hour, we said the quartile is only one.
+
+2. "Ten-year level observations" is the mean of the corenesses in the past ten years, as is the "moving average" mentioned in office hour.
+```{r}
+
+allObservations = data.frame(year = integer(), prod_company = character(), 
+                             ev = double(), tenYearCore = double())
+
+for (i in unique(dataFilms$prod_company)){
+  
+  # Get all the records of the company
+  coreList = producerCore[producerCore$prod_company == i, ]
+  
+  # newList will store year, company, coreness and ten-year level observations. We create consistent years.
+  newList = data.frame(year = c(min(coreList$year):max(coreList$year)))
+  newList$prod_company = i
+  newList = left_join(newList, coreList, by = c("year", "prod_company"))
+  
+  # Fewer than ten observations: treat the non-existent observations as zeros. Here, we have created consistent year and fill them with 0.
+  newList <- newList %>%
+    mutate(ev = coalesce(ev, 0))
+
+  newList$tenYearCore = 0
+  
+  for (j in c(1:nrow(newList))){
+     
+    # Calculate the average. For example, if a company has records in 2013~2015, then for 2013, observation = 0, for 2014, observation = coreness of 2013, and for 2015, observation  = mean(coreness of 2013 and 2014).
+    # If a company has records in 2003~2015, then for 2013, the observation = mean(coreness of 2003 ~ coreness of 2012)
+    if ((1 < j) & (j <= 10)) newList[j, 4] = mean(newList[c(1:(j-1)),3])
+    else{
+      if (j > 10) newList[j, 4] = mean(newList[c((j-10):(j-1)),3])
+      else newList[j, 4] = 0
+    }
+  }
+  
+  #newList = newList[newList$year %in% coreList$year,]
+  
+  allObservations = rbind(allObservations, newList)
+  
+}
+
+```
+
+Calculate the quartile and label generalist/specialist
+```{r}
+
+quartile = quantile(allObservations$tenYearCore, 0.75)
+
+dataFilms1 = left_join(dataFilms, allObservations, by = c("year", "prod_company"))
+
+# isGeneralist: 0 if it is specialist, else 1.
+
+# dataFilms1$isGeneralist = as.numeric(dataFilms1$ev >= quartile)
+
+dataFilms1$isGeneralist = as.numeric(dataFilms1$tenYearCore >= quartile)
+
+
+```
+
+# Question 1
+## 1A
+Classify the films
+```{r}
+
+filmClass = data.frame(pindex = integer(), film = character(), class = integer(), year = integer())
+
+for (i in unique(dataFilms$project)){
+  
+  # Get the list of the film
+  filmOnly = dataFilms1[dataFilms1$project == i,]
+  
+  # Know if there is only one or multiple producers
+  number = nrow(filmOnly)
+  
+  mix = sum(filmOnly$isGeneralist)
+  
+  # 1: Peripheral solo productions
+  # 2: Central solo productions
+  # 3 
+  
+  if(number == 1){
+    
+    if (mix == 0) type = 1
+    else type = 2
+    
+  }else{
+    
+    if(mix == 0) type = 4
+    if(mix == number) type = 3
+    if((0 < mix)&(mix < number)) type = 5
+    
+  }
+  
+  filmOnly = data.frame(pindex = filmOnly[1,1], film = i, year = filmOnly[1,2], class = type)
+  
+  filmClass = rbind(filmClass, filmOnly)
+  
+}
+
+```
+
+New Keywords
+```{r}
+
+filmYear = unique(dataFilms1[,c(1,2)])
+keywords_data = merge(filmYear, dataKeywords, by = c("pindex"))
+
+# Get the first time the keyword appeared
+keywordFirstTime = sqldf("select keyword, min(year) as firstTime from keywords_data group by keyword")
+
+keywordTime = left_join(keywords_data, keywordFirstTime, by = "keyword")
+
+# Mark the appearance within 3 years to be "new"
+keywordTime$first = as.numeric((keywordTime$year >= keywordTime$firstTime) & (keywordTime$year <= keywordTime$firstTime + 2))
+
+newYear = sqldf("select a.*, sum(b.first) as numberofNewWord from filmYear a, keywordTime b where a.pindex = b.pindex group by b.pindex")
+
+
+```
+
+New combinations
+```{r}
+
+dataKeywords = data.table(dataKeywords, key = "pindex")
+
+keyComb = merge(dataKeywords, dataKeywords, allow.cartesian=TRUE)
+
+keyComb = keyComb[keyComb$keyword.x!=keyComb$keyword.y,]
+
+# Get the first time the combination appeared
+
+filmYear = data.table(filmYear, key = "pindex")
+
+keyComb = keyComb[filmYear]
+
+keyComb = na.omit(keyComb)
+
+keyComb[, pair:= str_c(keyword.x, '_', keyword.y)]
+
+keyComb[, firstTime:= min(year), by = pair]
+
+# Mark the appearance within 3 years to be "new"
+keyComb[, first:= as.numeric((year >= firstTime) & (year <= firstTime + 2))]
+
+newYear2 = sqldf("select a.*, sum(b.first) as numberofNewComb from filmYear a, keyComb b where a.pindex = b.pindex group by b.pindex")
+
+
+```
+
+
+Draw the graph
+```{r}
+newType = merge(newYear, filmClass[,c(1,4)], by = "pindex")
+
+# Count how many new keywords appeared in each film type in each year
+plotKeyword = sqldf("select class, year, sum(numberofNewWord) as totalNewWord from newType group by class, year")
+
+ggplot(plotKeyword, aes(x = year, y = totalNewWord, color = factor(class))) + 
+  geom_line() + 
+  geom_point() +
+  labs(x = "Year", y = "Total number of new keywords", color = "type") + 
+  scale_color_manual(labels = c("Peripheral solo productions", "Central solo productions","Central co-productions", "Peripheral co-productions", "Hybrid co-productions"), values = rainbow(5))
+```
+
+
+```{r}
+
+newType1 = merge(newType, newYear2[,c(1,3)], by = "pindex")
+
+# Count how many new keywords appeared in each film type in each year. When we use merge, we literally used permutation instead of combination. To solve this problem, we can divide the sum of new combinations by 2. 
+
+# Example: if a new combination, keyword a and b appeared in a film, we counted (a,b) and (b,a) by using self-join. The number of new combinations will be 2 instead of 1 (but it should be 1).
+
+plotComb = sqldf("select class, year, sum(numberofNewComb)/2 as totalNewComb from newType1 group by class, year")
+
+ggplot(plotComb, aes(x = year, y = totalNewComb, color = factor(class))) + 
+  geom_line() + 
+  geom_point() +
+  labs(x = "Year", y = "Total number of new combinations", color = "type") + 
+  scale_color_manual(labels = c("Peripheral solo productions", "Central solo productions","Central co-productions", "Peripheral co-productions", "Hybrid co-productions"), values = rainbow(5))
+
+```
+
+
+
+#1B
+
+##Prepare the data
+```{r}
+
+# Collaboration predictors
+
+# dataFilms2 stores the information of film types and film-producer info.  
+dataFilms1 = left_join(dataFilms1, filmClass[,c(1,4)], by = "pindex")
+
+# coProd stores the information of collaboration predictors
+coProd = sqldf("select pcindex, year, class, count(*) as numCoProd from dataFilms1 group by pcindex, year, class")
+
+coProd = data.table(coProd)
+setkey(coProd, pcindex, year)
+
+coProd1 = coProd[class == 3][,totalCoProd1 := sum(numCoProd), by = list(pcindex, year)]
+coProd1 = coProd1[,c(1,2,5)]
+setkey(coProd1, pcindex, year)
+
+coProd2 = coProd[class == 4][,totalCoProd2 := sum(numCoProd), by = list(pcindex, year)]
+coProd2 = coProd2[,c(1,2,5)]
+setkey(coProd2, pcindex, year)
+
+coProd3 = coProd[class == 5][,totalCoProd3 := sum(numCoProd), by = list(pcindex, year)]
+coProd3 = coProd3[,c(1,2,5)]
+setkey(coProd3, pcindex, year)
+
+coProd = merge(coProd1, coProd2, all = TRUE)
+coProd = merge(coProd, coProd3, all = TRUE)
+
+colnames(coProd) = c("pcindex", "year", "coProd1", "coProd2", "coProd3")
+coProd = data.table(coProd)
+setkey(coProd, pcindex, year)
+coProd[is.na(coProd)] <- 0
+
+
+
+# box office revenue
+
+dataFilms1 = left_join(dataFilms1, dataBox, by = "pindex")
+dataFilms1 = na.omit(dataFilms1)
+
+# boxRevenue stores annual box revenue of each producer
+
+boxRevenue = sqldf("select pcindex, year, sum(total_box) as revenue from dataFilms1 group by pcindex, year")
+
+boxRevenue = data.table(boxRevenue)
+setkey(boxRevenue, pcindex, year)
+
+
+
+# isSub: whether or not the producer is a subsidiary
+
+isSub = merge(dataFilms1, dataTime, all.x = TRUE, by = "pcindex")
+
+isSub$is = as.numeric((isSub$year >= isSub$first_year) & (isSub$year <= isSub$last_year))
+
+isSub[is.na(isSub$is),]$is = 0
+
+isSub = sqldf("select distinct pcindex, year, `is` from isSub")
+
+isSub = data.table(isSub)
+setkey(isSub, pcindex, year)
+
+
+
+# inOperation: how many years the producer has been in operation
+
+inOperation = sqldf("select distinct pcindex, year from dataFilms1")
+inOperation$rank = 0
+
+for (i in c(1:nrow(inOperation))){
+  
+  company = inOperation[i,1]
+  year = inOperation[i,2]
+  
+  yearOrder = inOperation[inOperation$pcindex == company,]$year
+  yearOrder = sort(yearOrder)
+  
+  inOperation[i,3] = which(yearOrder == year)
+  
+}
+
+inOperation = data.table(inOperation)
+
+setkey(inOperation, pcindex, year)
+
+
+
+# new keywords/combinations; offset(total films the producer made that year, for which there is keyword information)
+
+newYear = data.table(newYear)
+setkey(newYear, pindex, year)
+
+newYear2 = data.table(newYear2)
+setkey(newYear2, pindex, year)
+
+setkey(dataFilms1, pindex, year)
+
+dataFilms1 = newYear[dataFilms1]
+dataFilms1 = newYear2[dataFilms1]
+
+newKeywords = dataFilms1[, list(numberofNewKeywords = sum(numberofNewWord), numberofNewComb = sum(numberofNewComb), totalNewFilms = length(unique(pindex))),by = c("pcindex", "year")]
+setkey(newKeywords, pcindex, year)
+
+```
+
+
+## Multidimensional scaling
+```{r}
+
+coordinate = data.frame(pcindex = integer(), year = integer(), coordinate1 = double(), coordinate2 = double())
+
+# for question 2
+distance = data.frame(pcindex1 = integer(), pcindex2 = integer(), year = integer(), disJaccard = double())
+
+# film_company_keyword stores the information of keywords matching producers
+film_company_keyword = left_join(x = dataKeywords, y = dataFilms[,c(1,2,4)], by = "pindex", copy = TRUE)
+
+for (i in c(1987:2019)){
+  
+  # Get the data in the time window
+  producer_keyword = film_company_keyword[(film_company_keyword$year <= i) & (film_company_keyword$year >= (i-2)),c(4,2)]
+  
+  # reference (I do not really understand what is going on here entirely, but successfully created the adjacency matrix with the help of: https://solomonmg.github.io/post/working-with-bipartite-affiliation-network-data-in-r/
+  
+  A <- spMatrix(nrow=length(unique(producer_keyword$keyword)),
+                ncol=length(unique(producer_keyword$pcindex)),
+                i = as.numeric(factor(producer_keyword$keyword)),
+                j = as.numeric(factor(producer_keyword$pcindex)),
+                x = rep(1, length(as.numeric(producer_keyword$keyword))) )
+  row.names(A) <- levels(factor(producer_keyword$keyword))
+  colnames(A) <- levels(factor(producer_keyword$pcindex))
+  
+  jaccard = proxy::dist(as.matrix(A), method = "jaccard", by_rows = FALSE)
+  
+  cmdscaleJ = stats::cmdscale(jaccard, k = 2)
+  
+  df1 = data.frame(pcindex = names(jaccard), year = i, coordinate1 = cmdscaleJ[,1], coordinate2 = cmdscaleJ[,2])
+  
+  coordinate = rbind(coordinate, df1)
+  
+  
+  # "pair" stores the information of the names of the two producers when we calculate the jaccard distance. We store this information in case of future use to avoid more slow for-loops.
+  
+  pair = t(combn(names(jaccard), 2))
+  
+  df2 = data.frame(pcindex1 = pair[,1], pcindex2 = pair[,2], year = i, dis = as.numeric(jaccard))
+  
+  distance = rbind(distance, df2)
+}
+
+coordinate = data.table(coordinate)
+setkey(coordinate, pcindex, year)
+
+distance = data.table(distance)
+
+# Store the information and avoid running the slow for-loop next time.
+fwrite(coordinate, "multidimensional_Coordinate.csv")
+fwrite(distance, "jaccard_distance.csv")
+
+```
+
+
+##Merge the data for regression
+```{r}
+
+# Merge all the data
+
+df1b = coProd[coordinate]
+df1b = newKeywords[df1b]
+df1b = isSub[df1b]
+df1b = boxRevenue[df1b]
+df1b = inOperation[df1b]
+
+
+```
+
+
+##Regression
+```{r}
+
+# New keywords vs. variables
+
+summary(glm.nb(numberofNewKeywords ~ coProd1 + coProd2 + coProd3 + coordinate1 + coordinate2 + revenue + rank + is + factor(year), data = df1b, offset(totalNewFilms)))
+
+```
+
+
+```{r}
+
+# New combinations vs. variables
+
+summary(glm.nb(numberofNewComb ~ coProd1 + coProd2 + coProd3 + coordinate1 + coordinate2 + revenue + rank + is + factor(year), data = df1b, offset(totalNewFilms)))
+
+```
+
+
+
+From the result of the first regression, variables are all statistically significant except coProd2, which means that central co-productions and hybrid co-productions predictors count. 
+
+Specifically, both coefficients of the two predictors are positive. Coworking with generalists or a group of generalists and specialists will positively affect creativity.
+
+In addition, the control variables are significant, including a producer’s box office revenue that year, how many years the producer has been in operation, whether or not the producer is a subsidiary,
+and a variable for the current year.
+
+
+
+From the result of the second regression, variables are all statistically significant, which means that central co-productions, peripheral co-productions and hybrid co-productions predictors count.
+
+Specifically, all coefficients of co-productions and hybrid co-productions predictors are positive. It means that working with generalists, specialists or a group of generalists and specialists will positively affect creativity. 
+
+In addition, the control variables are significant, including a producer’s box office revenue that year, how many years the producer has been in operation, whether or not the producer is a subsidiary,
+and a variable for the current year.
+
+
+
+In general, central co-productions and hybrid co-productions predictors help with the innovation.
+
+
+
+#Question 2
+##Prepare the data
+```{r}
+
+distance = fread("jaccard_distance.csv", header = TRUE, encoding="Latin-1")
+distance = data.table(distance)
+
+# Calculate average Jaccard distance of each company
+avgJaccard = sqldf("select pcindex1, year, avg(dis) as aveDistance from distance group by pcindex1, year")
+
+avgJaccard = unique(distance[, list(aveDistance = mean(dis)), by = c("pcindex1", "year")])
+colnames(avgJaccard)[colnames(avgJaccard) == "pcindex1"] = "pcindex"
+
+avgJaccard = data.table(avgJaccard)
+setkey(avgJaccard, pcindex, year)
+
+# Merge the data with our regression data
+df2 = df1b
+df2 = avgJaccard[df2]
+
+df2[is.na(df2$numberofNewKeywords)]$numberofNewKeywords = 0
+df2[is.na(df2$numberofNewComb)]$numberofNewComb = 0
+
+```
+
+##Draw the plot
+```{r}
+
+p = ggplot(df2, aes(aveDistance, numberofNewKeywords)) + 
+  geom_smooth(method = "loess", se = T) + 
+  labs(x = "Average Jaccard distance", y = "New keywords")
+
+print(p)
+
+```
+
+```{r}
+
+p2 = ggplot(df2, aes(aveDistance, numberofNewComb)) + 
+  geom_smooth(method = "loess", se = T) + 
+  labs(x = "Average Jaccard distance", y = "New combinations")
+
+print(p2)
+
+```
+
+From the graph of average Jaccard distance versus new keywords, we can observe that the number of new keywords increases when Jaccard distance increases then decreases. It indicates that a moderate Jaccard distance in collaboration is important: the coworkers should be neither too similar nor too different.
+
+It helps to explain why central co-productions and hybrid co-productions count in question 1. A group of generalists and specialists share both similarities and differences due to variety, and can produce a quite innovative film. Besides, generalists have important positions in the network and more resources. A group of generalists will also have innovative ideas to produce a film.
+
+
+
+#Question 3
+##Prepare the financial data
+```{r}
+
+# Get the financial data
+
+financeData = merge(dataBox[,c(4,1,3)], dataFilms[,c(1,2,4)], by = "pindex")
+financeData = data.table(financeData)
+finance = financeData[, list(revenue = sum(total_box), cost = sum(release_coverage)), by = c("pcindex", "year")]
+
+# Standardize the return
+
+finance$yearlyReturn = finance$revenue/(finance$cost)
+return = finance$yearlyReturn
+# The release_coverage is 0 for some producers, making their return infinite. I exclude all the infinite numbers.
+return[is.infinite(return)] = NA
+finance$yearlyReturn = return
+
+finance[, standReturn := (yearlyReturn - mean(yearlyReturn))/sd(yearlyReturn, na.rm = TRUE), by = year]
+
+finance = data.table(finance)
+finance = finance[,c(1,2,6)]
+setkey(finance, pcindex, year)
+
+```
+
+##Run the regression
+```{r}
+
+df3 = df1b
+
+# Merge the regression data with financial data
+
+df3 = finance[df3]
+
+summary(lm(return ~ coProd1 + coProd2 + coProd3 + coordinate1 + coordinate2 + revenue + rank + is + factor(year), data = df3))
+
+```
+
+From the result of the regression, all collaborations have statistically significant negative effect on financial performance. Working with people may cost too much and can be financially risky.
+
+
+
+#Question 4
+##4.A
+###Prepare the data
+```{r}
+
+dataFilms4 = dataFilms1
+dataFilms4[is.na(dataFilms4)] = 0 
+
+# solo new keywords
+
+df41 = sqldf("select distinct pcindex, year, sum(numberofNewWord) as newWord from dataFilms4 where class = 1 or class = 2 group by pcindex, year")
+
+# cumulative number of new keywords a producer has introduced in all of its films through the current year that were made in “hybrid” collaborations.
+
+df42 = sqldf("select distinct pcindex, year, sum(numberofNewWord) over (partition by pcindex order by year) as newWordfromColl from dataFilms4 where class = 5")
+
+df41 = data.table(df41)
+setkey(df41, pcindex, year)
+
+df42 = data.table(df42)
+setkey(df42, pcindex, year)
+
+```
+
+### Regression
+```{r}
+
+df4 = df3
+df4 = df41[df4]
+df4 = df42[df4]
+
+summary(glm.nb(newWord ~ newWordfromColl + coordinate1 + coordinate2 + revenue + rank + is + factor(year), data = df4, offset(totalNewFilms)))
+
+```
+
+From the result of the regression, the number of new keywords has a positive effect on the number of new keywords. It implies that working with others strengthens the power of working alone because of learning from others.
+
+
+
+##4.B
+```{r}
+
+df4b = sqldf("select pcindex, year, sum(numberofNewKeyword) as newWord from df3 group by pcindex, year")
+df4b = data.table(df4b)
+setkey(df4b, pcindex, year)
+
+df4b = df4b[df3]
+
+summary(lm(standReturn ~ newWord + coProd1 + coProd2 + coProd3 + coordinate1 + coordinate2 + revenue + rank + is + factor(year), data = df4))
+
+
+```
+
+From the result of regression, the coefficient of introducing new keywords is statistically significant positive. It means that more new keywords leads to higher box office returns. Even though collaborations can be financially risky, the result of collaborations, being more innovative, will lead to higher return.
+
+
+
+# Extra credit
+## Define a cast member’s innovativeness
+```{r}
+df5 = dataCastNum
+
+df5 = data.table(df5)
+setkey(df5, pindex, year)
+
+# Dataframe newYear stores pindex, year, number of new keywords, generated in question 1.
+
+newYear = data.table(newYear)
+setkey(newYear, pindex, year)
+
+# Merge the data
+
+df5 = newYear[df5]
+
+df5 = df5[, c(1,2,3,5)]
+
+# dataframe memberInnovativeness: the cumulative number of new keywords created in the films that they have worked on in their career up to the prior year as "innovativeness"
+
+df5[is.na(df5)] = 0
+
+memberInnovativeness = sqldf("select nconst, year, sum(numberofNewWord) over (partition by nconst order by year) as newCumWord from df5")
+```
+
+I use the sum of "innovativeness", the cumsum of new keywords created by the talent as the level of talent of the film, because I think "sum" will give us the total power of the group of talents in the film. Both the number of talents and their personal talent count.
+```{r}
+memberInnovativeness = sqldf("select distinct * from memberInnovativeness")
+memberInnovativeness = data.table(memberInnovativeness)
+setkey(memberInnovativeness, nconst, year)
+
+# dataframe df51 merges the innovativeness information and cast information
+
+df51 = sqldf("select a.*, b.newCumWord from df5 a, memberInnovativeness b where a.nconst = b.nconst and a.year = b.year")
+
+# dfFilmTalent stores the level of talent of the film: the total innovativeness of all talents in the cast of the film
+
+dfFilmTalent = sqldf("select pindex, sum(newCumWord) as talent from df51 group by pindex")
+
+# df52 helps merge the data and the film-producer data. It stores the level of talent of the company: the total innovativeness of all films. I still do sum instead of average because I think the number counts.
+
+dataFilms5 = dataFilms1
+df52 = merge(dataFilms5, dfFilmTalent, by = "pindex")
+df52 = sqldf("select pcindex, year, sum(talent) as talent from df52 group by pcindex, year")
+
+# df53 helps merge the data and the regression data
+df53 = df52
+df53 = data.table(df53)
+setkey(df53, pcindex, year)
+df53 = df53[df1b]
+```
+
+## Regression
+
+As the question requires, we only focus on hybrid co-productions, which is coProd3 in my data. The rest of the regression is the same as that in question 1.
+```{r}
+
+summary(glm.nb(talent ~ coProd3 + coordinate1 + coordinate2 + revenue + rank + is + factor(year), data = df53, offset(totalNewFilms)))
+
+```
+
+The result of the regression shows that the number of hybrid co-productions will have a positve effect on the innovativeness of the hired creative talent. It means that collaborating with one another in hybrid co-productions helps with hiring more innovative talent going forward.

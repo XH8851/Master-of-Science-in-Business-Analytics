@@ -1,0 +1,896 @@
+---
+title: "..."
+output: 
+---
+
+#Load the library
+```{r}
+library(igraph)
+library(data.table)
+library(reshape)
+library(tidyr)
+library(reshape2)
+library(expm)
+library(plyr)
+library(readxl)
+library(purrr)
+library(sqldf)
+library(ggplot2)
+library(zoo)
+library(ITNr)
+library(dplyr)
+library(cluster)
+library(tidyverse) 
+library(factoextra)
+library(lubridate)
+library(PearsonDS)
+library('Matrix')
+library(MASS)
+library(plm)
+library(pglm)
+library(plotly)
+
+setwd('...')
+```
+
+
+# Load the data
+```{r}
+
+dataInvDeal = fread("investors_and_deals.csv", header = TRUE, encoding="Latin-1")
+dataStartup = fread("company_details.csv", header = TRUE, encoding="Latin-1")
+dataDeal = fread("deal_details.csv", header = TRUE, encoding="Latin-1")
+dataInv = fread("investor_details.csv", header = TRUE, encoding="Latin-1")
+
+names(dataDeal)[1] = "Deal_Id"
+
+```
+
+
+## Status relationship
+```{r}
+
+# find the deals that have non-missing values for status
+dataInvDeal = dataInvDeal[dataInvDeal$Current_Investor_Status != ""]
+
+# find the deals that have date recorded
+dataDeal = dataDeal[dataDeal$Deal_Date != ""]
+
+# process the character type of date to be date type
+dataDeal$Deal_Date = as.Date(dataDeal$Deal_Date, "%d %b %y")
+dataDeal$year = format(dataDeal$Deal_Date, format = "%Y")
+
+# deals that have occurred from 1990 onward
+dataDeal = dataDeal[dataDeal$year >= 1990 & dataDeal$year <= 2018]
+dataInvDeal = dataInvDeal[dataInvDeal$Deal_Id %in% dataDeal$Deal_Id]
+
+```
+
+```{r}
+
+# I need to merge the year of deal to investor-deal table.
+
+dataInvDeal = data.table(dataInvDeal)
+setkey(dataInvDeal, "Deal_Id")
+
+dataDeal = data.table(dataDeal)
+setkey(dataDeal, "Deal_Id")
+
+df1 = merge(dataInvDeal, dataDeal, by = 'Deal_Id', all.x = TRUE)
+
+
+# I used sql to self-join the table of investors and deals, count the number of deals firm A and firm B invested as 'totalDeals' and count the times firm A is the lead as 'lead'.
+
+# I used sum(Lead_Investor) because this variable is a boolean variable. It is 1 when firm A is the lead and 0 otherwise, so summing it up means counting the times of 1, which is the times of being the lead.
+
+# I tested it in the table view. A few conditions are: 
+# 1. firm A and firm B can both be the lead. It is counted for both separately. For example, X->Y may had the number of lead = 2, and Y -> X may had the number of lead = 1. The lead of a deal is not only one.
+# 2. X -> Y and Y -> X are both included in the table. It's on the right track.
+# 3. X -> X is excluded in the query.
+
+df1_status = data.frame(Investor_Id = character(), weight = double(), year = integer())
+
+# In df1, the year we got was a character, not integer. Here I changed it to interger.
+
+df1$year = as.numeric(df1$year)
+df1 = data.table(df1)
+df1$year = as.numeric(df1$year)
+
+years = sort(unique(df1$year))
+
+# for (i in years){
+#   
+#   # exclude ties that have not been renewed after five years. That is, the ties 5 years ago.
+#   
+#   df1_deals = sqldf(paste("select * from df1 where year >= ", i - 5, " and year <= ", i))
+#   
+#   df1_InvCowork = sqldf("select a.Investor_Id as firmA, b.Investor_Id as firmB, count(*) as totalDeals, sum(a.Lead_Investor) as lead from df1_deals a, df1_deals b where a.Deal_Id = b.Deal_Id and a.Investor_Id != b.Investor_Id group by firmA, firmB")
+# 
+#   # The sql query has excluded the firms that did not co-invest with other firms because of the self-join. The minimum of totalDeals is 1.
+#   
+#   df1_InvCowork$status = df1_InvCowork$lead/df1_InvCowork$totalDeals 
+#   
+#   df1_InvCowork = df1_InvCowork[,c(1,2,5)]
+#   
+#   names(df1_InvCowork) = c("from", "to", "weight")
+#   
+#   # Get the Bonacich centrality
+
+#   df1_network = power_centrality(graph.data.frame(df1_InvCowork), exponent = .75, sparse = TRUE)
+#   
+#   df1_status_sub = data.frame(Investor_Id = names(df1_network), 
+#                               weight = unname(df1_network))
+#   
+#   df1_status_sub$year = i
+#   
+#   df1_status = rbind(df1_status, df1_status_sub)
+#   
+# }
+
+#fwrite(df1_status, "df1_status.csv")
+
+#rm(df1_InvCowork)
+
+#rm(df1_status_sub)
+
+#rm(df1_deals)
+
+```
+
+
+
+# Question 1
+
+## Other variables
+```{r}
+
+# Load the status 
+df1_status = fread("df1_status.csv", header = TRUE, encoding="Latin-1")
+
+# Merge the investor information with investor-deal information.
+dataInv = data.table(dataInv)
+df1 = data.table(df1)
+
+names(dataInv)[1] = 'Investor_Id'
+
+df1 = left_join(df1, dataInv[,c(1,3)], by = 'Investor_Id', all.x = TRUE)
+
+# Merge the status information with investor-deal information. 
+df1 = left_join(df1, df1_status, by = c("Investor_Id" = "Investor_Id", "year" = "year"))
+
+```
+
+
+### Calculate hhi
+```{r}
+
+# Merge the startups information with investor-deal information
+
+names(dataStartup)[1] = "CompanyId"
+
+df1 = left_join(df1, dataStartup, by = "CompanyId")
+
+df1 = data.table(df1)
+
+# Calculate the hhi
+
+df1_hhi = data.table(Investor_Id = character(), hhi = double(), year = integer())
+
+for (i in years){
+  
+  # Know how many cumulative deals an investor made in each year in each industry
+  df1_investor = sqldf(paste("select Investor_Id, count(*) as indDeals from df1 where year <= ", i, " group by Investor_Id, Primary_Industry_Code"))
+  
+  # Know how many deals an investor made in each year in total
+  df1_investor1 = sqldf(paste("select Investor_Id, sum(indDeals) as totDeals from df1_investor group by Investor_Id"))
+  
+  # Merge the two tables
+  df1_investor = sqldf("select a.Investor_Id, a.indDeals, b.totDeals from df1_investor a, df1_investor1 b where a.Investor_Id = b.Investor_Id")
+  
+  # Delete the second table for more memory. Now df1_investor stores: investor, year, number of deals it made in one industry, total deals it made.
+  rm(df1_investor1)
+  
+  # Calculate market share
+  df1_investor$mktShare = df1_investor$indDeals*100/df1_investor$totDeals
+  
+  # Calculate hhi
+  df1_hhi_sub = sqldf("select Investor_Id, sum(mktShare*mktShare) as hhi from df1_investor group by Investor_Id")
+  
+  df1_hhi_sub$year = i
+  
+  df1_hhi = rbind(df1_hhi, df1_hhi_sub)
+
+}
+
+df1_hhi = data.table(df1_hhi)
+rm(df1_investor)
+rm(df1_hhi_sub)
+
+```
+
+
+### Originate
+```{r}
+df1_other_var = data.frame(Investor_Id = character(), originate = integer(), IT = integer(), early = integer(), age = integer(), year = integer())
+
+# the time of the first investment round this company has received
+df1_company_early = sqldf("select CompanyId, min(year) as first from df1 group by CompanyId")
+
+df1 = left_join(df1, df1_company_early, by = "CompanyId")
+rm(df1_company_early)
+
+# first_round: if this year is the first time the company received investment, TRUE
+df1$first_round = as.numeric(df1$year == df1$first)
+
+# Get the number of first-round investments made by an investor previously
+df1_originate = sqldf("select Investor_Id, year, sum(first_round) over (partition by Investor_Id order by year) from df1")
+
+# Get the number of total deals an investor made in one year
+df1_originate1 = sqldf("select Investor_Id, year, count(*) over (partition by Investor_Id order by year) as totDeals from df1")
+
+# Join the two tables
+df1_originate = left_join(df1_originate, df1_originate1, by = c("Investor_Id", "year"))
+rm(df1_originate1)
+
+# ratio stores the ratio of the companies it invests in, it invests in the first investment round this company has received
+df1_originate$ratio = df1_originate$`sum(first_round)`/df1_originate$totDeals
+
+df1_originate$year = as.numeric(df1_originate$year)
+
+# whether a venture capital firm tends to originate its own deals: more than 50%
+df1_originate$ratio = as.numeric(df1_originate$ratio > 0.5)
+
+df1_originate = df1_originate[,c(1,2,5)]
+
+```
+
+
+### IT
+```{r}
+
+# Get the numebr of IT investments previously 
+
+df1_IT = df1
+df1_IT$IT = as.numeric(df1_IT$Primary_Industry_Sector == 'Information Technology')
+df1_IT = sqldf("select Investor_Id, year, sum(IT) over (partition by Investor_Id order by year) as IT, count(*) over (partition by Investor_Id order by year) as totDeal from df1_IT")
+
+df1_IT$isIT = as.numeric((df1_IT$IT/df1_IT$totDeal) > 0.5)
+df1_IT = df1_IT[,c(1,2,5)]
+
+df1_IT$year = as.numeric(df1_IT$year)
+
+df1_other_var = left_join(df1_originate, df1_IT, by = c("Investor_Id", "year"))
+rm(df1_originate)
+rm(df1_IT)
+
+```
+
+
+### early-stage startups
+```{r}
+
+df1_early = df1
+df1_early$early = as.numeric(df1_early$Deal_Type_1 %in% c("Early Stage VC", "Accelerator/Incubator", "Seed Round", "Angel (individual)"))
+df1_early = sqldf("select Investor_Id, year, sum(early) over (partition by Investor_Id order by year)  as early, count(*) over (partition by Investor_Id order by year) as totDeal from df1_early")
+
+df1_early$isEarly = as.numeric((df1_early$early/df1_early$totDeal) > 0.5)
+df1_early = df1_early[,c(1,2,5)]
+
+df1_early$year = as.numeric(df1_early$year)
+
+df1_other_var = left_join(df1_other_var, df1_early, by = c("Investor_Id", "year"))
+
+rm(df1_early)
+
+```
+
+
+## Question 1a
+```{r}
+
+# store year and age information in df1_hhi. They do not need lagged values.
+df1_hhi = data.table(df1_hhi)
+df1_hhi[, age := year - min(year), by = "Investor_Id"]
+
+# store status information in df1_other_var. They all need lagged values.
+df1_other_var = data.table(df1_other_var)
+
+df1_other_var = left_join(df1_other_var, df1_status, by = c("Investor_Id", "year"))
+
+df1_other_var = arrange(df1_other_var, year)
+
+df1_other_var <- df1_other_var %>%                            
+  group_by(Investor_Id) %>%
+  dplyr::mutate(lagOri = dplyr::lag(ratio, n = 1, default = NA)) %>% 
+  as.data.frame()
+
+df1_other_var <- df1_other_var %>%                            
+  group_by(Investor_Id) %>%
+  dplyr::mutate(lagIT = dplyr::lag(isIT, n = 1, default = NA)) %>% 
+  as.data.frame()
+
+df1_other_var <- df1_other_var %>%                            
+  group_by(Investor_Id) %>%
+  dplyr::mutate(lagEarly = dplyr::lag(isEarly, n = 1, default = NA)) %>% 
+  as.data.frame()
+
+df1_other_var <- df1_other_var %>%                            
+  group_by(Investor_Id) %>%
+  dplyr::mutate(lagStatus= dplyr::lag(status, n = 1, default = NA)) %>% 
+  as.data.frame()
+
+# Merge df1_hhi and df1_other_var
+
+df1_other_var = df1_other_var[,c("Investor_Id", "year", "lagStatus", "lagOri", "lagIT", "lagEarly")]
+
+df1a = right_join(df1_hhi, df1_other_var, by = c("Investor_Id", "year"))
+
+# Regression
+
+summary(plm(hhi ~ lagStatus + I(lagStatus^2) + lagOri + lagIT + lagEarly + age + factor(year), model = "within", effect = "individual", data = df1a, index = c("Investor_Id")))
+
+```
+
+Result:
+
+Coefficients: (1 dropped because of singularities)
+                Estimate Std. Error   t-value  Pr(>|t|)    
+lagStatus         3.2976     9.2880    0.3550    0.7226    
+I(lagStatus^2)   -9.6583     2.4226   -3.9867 6.726e-05 ***
+lagOri          157.0544    24.8549    6.3188 2.697e-10 ***
+lagIT             6.0820    25.9262    0.2346    0.8145    
+lagEarly       -663.0848    25.2740  -26.2358 < 2.2e-16 ***
+age            -415.4351     3.4276 -121.2017 < 2.2e-16 ***
+
+(factor year result will be too long so I hided them. It goes the same in the following results in other questions.)
+
+From the result, when we consider the linear relationship, the previous status will leave a positive impact on diversification, but this is not statistically significant. However, if we take a look at I(lagStatus^2), we can see the impact become negative, which means higher-status are more likely to diversify their investments into different industries.
+
+In general, the relationship between status and diversification is not linear, and higher status square means more diversification (less hhi).
+
+
+## Question 1b
+
+### niche width
+```{r}
+
+# First, we get the "summing the distances between each pair of industries that appear in its portfolio cumulatively through each year that it makes an investment" by variable "dis".
+df1_niche = data.frame(Investor_Id = character(), dis = double(), year = integer())
+
+for (i in years){
+  
+  # Get the deals until the current year
+  df1_deals = df1[df1$year <= i][,c("Primary_Industry_Code", "Investor_Id")]
+  
+  # Affiliation table: assume the industry is like the country, and investor is like the orgnization. The affiliation table will be the how many times this industry join the investors.
+  affiDF = as.data.frame.matrix(table(df1_deals))
+  affiDF = as.matrix(affiDF)
+  
+  # Calculate the jaccard distance matrix
+  dis = proxy::dist(affiDF, by_rows = TRUE, method = "Jaccard")
+  dis = as.matrix(dis)
+  
+  df1_deals = data.table(df1_deals)
+  
+  # indNumber: know how many unique industries the investor has invested in. 
+  df1_deals[, indNumber := .(count = length(unique(Primary_Industry_Code))), by = "Investor_Id"]
+  
+  # Exclude those who invest in a single industry category
+  df1_deals_zero = df1_deals[indNumber == 1]
+  
+  # Include those who invest in more than one industry
+  df1_deals = df1_deals[indNumber > 1]
+  
+  # Get the pairs of industries an investor invested in
+  # Gelpful reference (for my information): https://stackoverflow.com/questions/35442246/create-all-pairs-within-groups-and-maintaining-variables
+  distance = lapply(unique(df1_deals$Investor_Id), function(g) {
+    data.frame(
+      Investor_Id = g,
+      industry = t(combn(unique(df1_deals$Primary_Industry_Code[df1_deals$Investor_Id == g]), 2)))
+  })
+  
+  do.call(rbind, distance)
+  
+  # Make the list into a dataframe
+  distances = rbindlist(distance)
+  
+  # Transfer the jaccard distance matrix into a long table: industry1, industry2, the jaccard distance
+  dis = melt(dis)
+  
+  names(dis) = c("industry.1", "industry.2", "dis")
+  
+  # Merge the jaccard distance information with the pair information
+  distances = left_join(distances, dis, by = c("industry.1", "industry.2"))
+  
+  # Sum up the distances between each pair of industries that appear in its portfolio cumulatively through each year that it makes an investment
+  distance = sqldf("select Investor_Id, sum(dis) as dis from distances group by Investor_Id")
+  
+  # And those who invests in only one industry
+  df1_deals_zero$dis = 0
+  
+  # Add the distance and year information to our table
+  distance = rbind(distance, df1_deals_zero[,c(2,4)])
+  
+  distance$year = i
+  
+  df1_niche = rbind(df1_niche, distance)
+  
+}
+
+fwrite(df1_niche, "niche_distance.csv")
+
+rm(distance)
+rm(distances)
+rm(df1_deals)
+rm(affiDF)
+rm(dis)
+rm(df1_deals_sub)
+rm(df1_deals_zero)
+
+```
+
+
+```{r}
+
+df1_niche = fread("niche_distance.csv")
+
+# Count the number of industries an investor has invested till the current year
+indNumber = sqldf("select Investor_Id, year, count(distinct Primary_Industry_Code) over (partition by Investor_Id order by year) from df1")
+df1 = left_join(df1, indNumber, by = c("Investor_Id", "year"))
+
+df1[is.na(df1$indNumber)]$indNumber = 0
+
+# Join the information
+df1_niche = left_join(df1_niche, df1[,c("Investor_Id", "indNumber", "year")], by = c("Investor_Id", "year"))
+
+# For those who invested in only one industry, set the width 0.
+df1_niche$width = 0
+
+# Otherwise, compute the width niche using the function
+df1_niche[df1_niche$indNumber > 1,]$width = 1 / (1 + df1_niche[df1_niche$indNumber > 1,]$dis/ (df1_niche[df1_niche$indNumber > 1,]$indNumber - 1))
+
+
+
+```
+
+
+
+### regression
+```{r}
+
+df1_niche = sqldf("select distinct * from df1_niche")
+
+df1b = left_join(df1a, df1_niche, by = c("Investor_Id", "year"))
+
+#rm(df1a)
+
+summary(glm(width ~ lagStatus + I(lagStatus^2) + lagOri + lagIT + lagEarly + age + factor(year), data = df1b, family = quasibinomial(link = "logit")))
+
+```
+
+result:
+Coefficients:
+                 Estimate Std. Error t value Pr(>|t|)    
+(Intercept)    -2.886e+01  4.443e+00  -6.495 8.46e-11 ***
+lagStatus       4.271e-04  8.556e-03   0.050    0.960    
+I(lagStatus^2)  7.053e-03  1.798e-03   3.922 8.79e-05 ***
+lagOri          1.371e-01  1.975e-02   6.942 3.97e-12 ***
+lagIT           3.032e-02  1.971e-02   1.538    0.124    
+lagEarly       -1.024e-01  1.982e-02  -5.165 2.42e-07 ***
+age            -1.317e-01  2.877e-03 -45.781  < 2e-16 ***
+
+From the result, we can see that on the one hand, lagged status is not significantly correlated with diversity. On the other hand, square of lagged status is significantly correlated with diversity. It still indicates that a higher square of status will lead to a higher diversification.
+
+
+## Question 1c
+```{r}
+
+# Rerun the regression and store the result
+
+df1_model = glm(width ~ lagStatus + I(lagStatus^2), data = df1b, family = quasibinomial(link = "logit"))
+
+# Set up an object with range of values of the lagged status
+
+df1_object = data.frame(lagStatus = seq(
+  min(df1b$lagStatus, na.rm = TRUE), 
+  max(df1b$lagStatus, na.rm = TRUE), 
+  length.out = 100))
+
+# Generate fitted values for each of these status values from the regression. Save the error.
+
+df1_pred = predict(df1_model, df1_object, se.fit = TRUE)
+
+# Compute the left and right side of confidence level.
+
+df1c = data.frame(leftValue = df1_pred$fit - 1.96 * df1_pred$`se.fit`,
+                  value = df1_pred$fit,
+                  rightValue = df1_pred$fit + 1.96 * df1_pred$`se.fit`)
+
+# Merge all the data to df1c.
+
+df1c$lagStatus = df1_object[,1]
+
+rm(df1_model)
+rm(df1_object)
+rm(df1_pred)
+
+ggplot(df1c, aes(x =lagStatus, y = value)) +
+  geom_line() +
+  geom_smooth(aes(ymin = leftValue, ymax = rightValue), stat = "identity") +
+  theme_bw()
+
+```
+
+The result is consistent with our finding in question 1b: a high and low status (a large square of status) will both lead to high niche width. It is interesting that both high-status and low-status investors will invest in a various industries, and middle-status investors tend to concentrate on only a few industries.
+
+
+# Question 2
+
+## Question 2a
+```{r}
+
+rm(df1a)
+rm(df1c)
+
+# Judge if this deal is successful
+
+df2_suc = df1
+df2_suc$success = as.numeric(df2_suc$Deal_Type_1 %in% c("Early Stage VC", "Accelerator/Incubator", "Seed Round", "Angel (individual)"))
+
+# Compute cumulative success investments
+
+df2_suc = sqldf("select distinct Investor_Id, year, sum(success) over (partition by Investor_Id order by year) as suc from df2_suc")
+
+# Merge the data
+
+df2a = left_join(df1b, df2_suc, by = c("Investor_Id", "year"))
+rm(df1b)
+
+# Lag the width value
+
+df2a = arrange(df2a, year)
+
+df2a <- df2a %>%                            
+  group_by(Investor_Id) %>%
+  dplyr::mutate(lagWidth = dplyr::lag(width, n = 1, default = NA)) %>% 
+  as.data.frame()
+
+summary(pglm(suc ~ lagStatus + lagWidth + lagStatus:lagWidth + lagOri + lagIT + lagEarly + age + factor(year), model = "within", effect = "individual", data = df2a, index = c("Investor_Id"), family = "poisson"))
+
+
+```
+
+result:
+Estimates:
+                    Estimate Std. error t value  Pr(> t)    
+lagStatus          -0.006951   0.002241  -3.102  0.43203 
+lagWidth            0.261916   0.026805  -9.771  < 2e-16 ***
+lagOri             -0.082279   0.005177 -15.894  < 2e-16 ***
+lagIT               0.019986   0.004910   4.070 4.69e-05 ***
+lagEarly            0.212778   0.006036  35.249  < 2e-16 ***
+age                 0.121245        NaN     NaN      NaN    
+lagStatus:lagWidth  0.027048   0.022632   1.195  0.00192 **  
+
+From the result, we can see that the interaction is significantly related to successful investments, and the coefficient is positive. Therefore, it indicates that there is a synergistic effect of the two variables—high levels of both together have a positive effect on the outcome variable.
+
+
+## Question 2b
+```{r}
+
+# Re-run a similar model from 2A with just lagged status and lagged diversification and without using firm fixed effects
+
+df2_model = glm(suc ~ lagStatus + lagWidth + lagStatus : lagWidth, data = df2a, family = "poisson")
+
+# Set up an object with range of values of the lagged values: generate a range of values for lagged status and lagged diversification, similar to 1C.
+
+df2b = expand.grid(
+  lagStatus = seq(
+    min(df2a$lagStatus, na.rm = TRUE), 
+    max(df2a$lagStatus, na.rm = TRUE), 
+    length.out = 100), 
+  lagWidth = seq(
+    min(df2a$lagWidth, na.rm = TRUE), 
+    max(df2a$lagWidth, na.rm = TRUE), 
+    length.out = 100))
+
+df2b$pred = predict(df2_model, df2b)
+
+# regular 3d plot
+scatter3D(df2b$lagWidth, df2b$lagStatus, df2b$pred)
+
+# A contour plot
+plot_ly(
+  df2b,
+  x = ~lagStatus,
+  y = ~lagWidth,
+  z = ~pred,
+  type = "contour",
+  autocontour = FALSE,
+  contours = list(
+  end = max(df2b$pred, na.rm = TRUE),
+  size = abs(max(df2b$pred, na.rm = TRUE) - min(df2b$pred, na.rm = TRUE))/20,
+  start = min(df2b$pred, na.rm = TRUE),
+  showlines = FALSE
+  ),
+  line = list(smoothing = 0.85),
+  
+  colorscale = "Greys"
+) %>%
+  layout(font = cmodern) %>%
+    colorbar(len = 1, nticks = 10, title = "Estimated successful \n investments") %>%
+      layout(yaxis = list(title = "Lagged niche width")) %>%
+        layout(xaxis = list(title = "Lagged status")) 
+
+rm(p1)
+rm(df2b)
+rm(df2_model)
+
+```
+
+3D plot package is not availablt on Mac, so I ran the contour plot to analyze.
+
+In general, the contour plot, especiallly the light color on the top right, shows that a large z value (number of estimated successful investments, the light color in the plot) results from high x (lagged status) and y (lagged width) value together. It is consistent with the result in question 2a that two variables—high levels of both together have a positive effect on the outcome variable.
+
+
+
+# Question 3
+
+## Question 3a
+
+### Jaccard distance
+```{r}
+
+coordinate = data.frame(Investor_Id = character(), year = integer(), coordinate1 = double(), coordinate2 = double())
+
+# To measure the coordination process a firm engages in when it is a lead investor, only include in the variable calculations the deals for which a firm is the lead investor.
+
+df3 = df1[df1$Lead_Investor == 1]
+df3 = df3[df3$Primary_Industry_Sector != ""]
+
+for (i in years){
+  
+  # Get the deals until the current year
+  df3_deals = df3[df3$year <= i][,c("Investor_Id", "Primary_Industry_Sector")]
+  
+  # Get the multiscaled jaccard distance between two investors based on the industries they invested in until the current year. (Similar to the method in Assignment 4)
+  A <- spMatrix(nrow=length(unique(df3_deals$Primary_Industry_Sector)),
+                ncol=length(unique(df3_deals$Investor_Id)),
+                i = as.numeric(factor(df3_deals$Primary_Industry_Sector)),
+                j = as.numeric(factor(df3_deals$Investor_Id)),
+                x = rep(1, length(as.numeric(df3_deals$Primary_Industry_Sector))) )
+  row.names(A) <- levels(factor(df3_deals$Primary_Industry_Sector))
+  colnames(A) <- levels(factor(df3_deals$Investor_Id))
+  
+  jaccard = proxy::dist(as.matrix(A), method = "jaccard", by_rows = FALSE)
+  
+  cmdscaleJ = stats::cmdscale(jaccard, k = 2)
+  
+  df31 = data.frame(Investor_Id = names(jaccard), year = i, coordinate1 = cmdscaleJ[,1], coordinate2 = cmdscaleJ[,2])
+  
+  rownames(df31) <- c()
+  
+  coordinate = rbind(coordinate, df31)
+  
+}
+
+
+fwrite(coordinate, "jac_distance.csv")
+
+rm(df3_deals)
+rm(A)
+rm(jaccard)
+rm(cmdscaleJ)
+rm(df31)
+rm(df32)
+rm(pair)
+
+
+
+```
+
+
+### Medoid Value
+```{r}
+
+
+df3 = data.table(df3)
+
+# Know how many times an investor invested in a industry
+df3[, timesInd := .N, by = c("Investor_Id", "Primary_Industry_Sector", "year")]
+
+# Know how many industries the investor has invested in
+df3[, indNumber := length(unique(Primary_Industry_Sector)), by = c("Investor_Id", "year")]
+
+# medoid: a venture capital firm that only invests in that category in a particular year
+medoid = df3[df3$indNumber == 1, c("Primary_Industry_Sector", "year", "Investor_Id", "timesInd")]
+
+# I used the firms that invested in the industry most as the medoid, as there are more than one firms that only invested in the industry in one year.
+medoidMax = sqldf("select Primary_Industry_Sector, year, Investor_Id, max(timesInd) as timesInd from medoid group by Primary_Industry_Sector, year")
+
+# Now let's see investor-industry without setting "only invested in"
+medoid = df3[, c("Primary_Industry_Sector", "year", "Investor_Id", "timesInd")]
+
+# The number of rows is more, which means no investor only invested in the firm.
+medoidMaxElse = sqldf("select Primary_Industry_Sector, year, Investor_Id, max(timesInd) as timesInd from medoid group by Primary_Industry_Sector, year")
+
+# Find out the special industry and year. We can use as the medoid the firm with the most investments in this category
+special = sqldf('select Primary_Industry_Sector, year from medoidMaxElse except select Primary_Industry_Sector, year from medoidMax')
+special = medoidMaxElse[(medoidMaxElse$Primary_Industry_Sector %in% special$Primary_Industry_Sector)&(medoidMaxElse$year %in% special$year),]
+
+# Merge the two conditions
+medoid = rbind(medoidMax, special)
+
+rm(medoidMaxElse)
+rm(special)
+rm(medoidMax)
+
+# Merge the medoid and jaccard distance information
+medoid = left_join(medoid, coordinate, by = c("Investor_Id", "year"))
+
+# Coordinates of the medoid for the industry category
+medoid = medoid[,c("Primary_Industry_Sector", "year", "coordinate1", "coordinate2")]
+
+
+```
+
+
+### Distance between an investor and the industry category
+```{r}
+
+# function "disInvInd" is to find out the distance between an investor and an industry in one year
+
+disInvInd <- function(x, c1, c2, c3){
+  
+  investor = x[c1]
+  industry = x[c2]
+  year = x[c3]
+  
+  d1 = coordinate[(coordinate$Investor_Id == investor) & (coordinate$year == year), c("coordinate1", "coordinate2")]
+  d2 = medoid[(medoid$Primary_Industry_Sector == industry) & (medoid$year == year), c("coordinate1", "coordinate2")]
+  d = sqrt((d1$coordinate1 - d2$coordinate1)**2 - (d1$coordinate2 - d2$coordinate2)**2)
+  
+  return(d)
+  
+}
+
+# find out the distance in each deal and well-organize the data
+
+df3$dis = apply(df3, 1, disInvInd, c1 = "Investor_Id", c2 = "Primary_Industry_Sector", c3 = "year")
+df3 = map(df3, as.data.frame)
+df3 = bind_rows(df3)
+
+```
+
+
+### Regression
+```{r}
+
+# 'ownDis' stores the information of the firm’s own average distance from the industry category medoids for the deals that it invests in in a given year
+ownDis = sqldf("select Investor_Id, year, avg(dis) as ownDis from df3 group by Investor_Id, year")
+
+df31 = df3[,c("Deal_Id", "Investor_Id", "year", "Primary_Industry_Sector", "dis")]
+
+# 'syndicate' is the average distance between a firm’s syndicate partners and the industry category medoids for the deals that it invests in in a given year. Here, syndicate partners do not include itself. I use self-join in sql to accomplish this.
+syndicate = sqldf("select a.Investor_Id, a.year, avg(b.dis) as synDis from df31 a, df31 b where a.Deal_Id = b.Deal_Id and b.Investor_Id != a.Investor_Id group by a.Investor_Id, a.year")
+
+rm(df31)
+
+df3a = df2a
+df3a = left_join(df3a, ownDis, by = c("Investor_Id", "year"))
+df3a = left_join(df3a, syndicate, by = c("Investor_Id", "year"))
+
+summary(plm(synDis ~ lagStatus + ownDis + lagstatus:ownDis + lagOri + lagIT + lagEarly + age + factor(year), model = "within", effect = "individual", data = df3a, index = c("Investor_Id")))
+
+
+```
+
+From the result, we can see that the lagStatus is significantly related to syndicate distances, and the coefficient is positive. Therefore, it indicates that high-status firms will use their influence
+to coordinate other firms’ expertise on deals that are further away from their own expertise, by *being the lead of the investments*.
+
+
+
+## Question 3b
+```{r}
+
+# Re-run a similar model from 3A
+df3_model = glm(synDis ~ lagStatus + ownDis + lagstatus:ownDis, data = df3a)
+
+# Set up an object with range of values of the lagged values
+
+df3b = expand.grid(
+  lagStatus = seq(
+    min(df3a$lagStatus, na.rm = TRUE), 
+    max(df3a$lagStatus, na.rm = TRUE), 
+    length.out = 100), 
+  ownDis = seq(
+    min(df3a$ownDis, na.rm = TRUE), 
+    max(df3a$ownDis, na.rm = TRUE), 
+    length.out = 100))
+
+df3b$pred = predict(df3_model, df3b)
+
+# A contour plot
+plot_ly(
+  df3b,
+  x = ~lagStatus,
+  y = ~ownDis,
+  z = ~pred,
+  type = "contour",
+  autocontour = FALSE,
+  contours = list(
+  end = max(df3b$pred, na.rm = TRUE),
+  size = abs(max(df3b$pred, na.rm = TRUE) - min(df3b$pred, na.rm = TRUE))/20,
+  start = min(df3b$pred, na.rm = TRUE),
+  showlines = FALSE
+  ),
+  line = list(smoothing = 0.85),
+  
+  colorscale = "Greys"
+) %>%
+  layout(font = cmodern) %>%
+    colorbar(len = 1, nticks = 10, title = "Estimated average \n syndicate distances") %>%
+      layout(yaxis = list(title = "Own average distances")) %>%
+        layout(xaxis = list(title = "Lagged status")) 
+
+
+```
+
+The contour plot shows that a small z value (estimated average syndicate distances, the light color in the plot) results from a high x (lagged status) value when we control the y (own distances) value. It is consistent with the result in question 3a that a higher lagged status in lead role will help with decreasing the average distance between an investor and the industry.
+
+
+
+# Extra credit
+
+Get the a set of all deals that occurred within a 30-day window of the date of this actual deal that occurred within that deal’s industry sector.
+```{r}
+
+df4 = df3
+
+df41 = df4[,c("Deal_Id", "Investor_Id", "year", "Primary_Industry_Sector", "dis", "Deal_Date")]
+
+# Self-join: use a sql query to find the deals within 30-day after the actual deal happened (the information in df41 b), within the same industry sector for the investor (the information in df41 a).
+
+df42 = sqldf("select distinct a.Investor_Id, a.year, b.Deal_Id, a.Primary_Industry_Sector from df41 a, df41 b where datediff(b.Deal_Date, a.Deal_Date) <= 30 and a.Investor_Id != b.Investor_Id and a.Primary_Industry_Sector = b.Primary_Industry_Sector")
+
+# The disInvInd is defined 
+df42$dis = apply(df42, 1, disInvInd, c1 = "Investor_Id", c2 = "Primary_Industry_Sector", c3 = "year")
+
+# Organize the data
+df42 = map(df42, as.data.frame)
+df42 = bind_rows(df42)
+
+# Now df42 is the information of investments in the matched sample that have not occurred
+df42$realized = 0
+
+# df41 is the information actual investments
+df41 = df41[, c("Deal_Id", "Investor_Id", "year", "Primary_Industry_Sector", "dis")]
+df41$realized = 1
+
+# Merge the two dataframes to df4_reg
+df4_reg = rbind(df41, df42)
+rm(df41)
+rm(df42)
+
+# Lag the distance
+cols <- c("Investor_Id", "Primary_Industry_Sector")
+df4_reg <- df4_reg %>%                            
+  group_by(across(all_of(cols))) %>%
+  dplyr::mutate(lagDis = dplyr::lag(dis, n = 1, default = NA)) %>% 
+  as.data.frame()
+
+```
+
+
+## Regression
+```{r}
+
+# Join other control variables to df4_reg.
+df4_reg = left_join(df4_reg, df3a, by = c("Investor_Id", "year"))
+
+# Run the regression as the format of assignment description.
+summary(glm(realized ~ lagStatus:lagDis + I(lagStatus^2):lagDis + lagOri + lagIT + lagEarly + age + factor(year), data = df4_reg, family = binomial(link = "logit")))
+
+```
+
+
+From the result of model, both lag_status:lag_distance_from_own_expertise and lag_status_squared:lag_distance_from_own_expertise have positive coefficients which are statistically significant, which means higher-status venture capital firms are more likely to make investments in more diversified industries. It kind of aligns with the results from Question 1, where low-status firms also make diversified investments.
